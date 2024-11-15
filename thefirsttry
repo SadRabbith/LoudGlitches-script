@@ -1,0 +1,470 @@
+import argparse
+import numpy as np
+import os
+import glob
+import pandas as pd
+from gwtrigfind import find_trigger_files
+from gwpy.table import EventTable
+from gwpy.segments import DataQualityDict
+from gwpy.timeseries import TimeSeries
+from gwpy.plot import BodePlot
+import datetime
+from scipy import signal
+from gwpy.time import tconvert
+from gwpy.time import from_gps
+from gwpy.time import to_gps
+from gwpy.segments import Segment
+from datetime import timedelta
+from itertools import islice
+from scipy.signal import correlate
+import matplotlib.pyplot as plt
+from gwpy.table import Table
+from gwpy.plot import Plot
+import time
+import h5py
+from gwpy.segments import SegmentList
+from gwpy.timeseries import TimeSeriesDict
+from gwdetchar import scattering
+from gwpy.segments import DataQualityFlag
+import math
+import matplotlib
+import statistics
+import seaborn as sns
+
+import pandas as pd
+import gwpy
+from scipy import stats
+from scipy.optimize import curve_fit
+#from scipy import asarray as ar,exp
+
+import warnings
+warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
+import lal
+from lal import LIGOTimeGPS
+
+lal.swig_redirect_standard_output_error(False)
+
+
+# Suppress the warning
+warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
+import csv
+from gwpy.frequencyseries import FrequencySeries
+from scipy.stats import f
+
+from pandas.core.computation.check import NUMEXPR_INSTALLED
+t_samp = pd.read_csv('/home/sadmansobhan.raabith/30_sec_analysis/times.csv')
+t_samp = t_samp['time']
+print(t_samp[0])
+
+all_psdN = []
+all_psdB = []
+all_freq = []
+
+chan = ['L1:LSC-DARM_IN1_DQ', 'L1:LSC-PRCL_IN1_DQ', 'L1:LSC-SRCL_IN1_DQ', 
+        'L1:LSC-MICH_IN1_DQ', 'L1:LSC-CARM_IN1_DQ', 'L1:LSC-MCL_IN1_DQ']
+
+times = [0.5, 1, 1.5]
+
+for c in chan:
+    for t in t_samp:
+        for i in times[0:1]:
+            T = 30
+            N_avg = 30
+            Td = T / N_avg  # FFT window length
+            
+            #c = 'L1:LSC-DARM_IN1_DQ'
+            # Get data before glitch (9-10 minutes before glitch)
+            tsB = t - (60 * 10)+1
+            teB = t - (60 * 9.5)+1
+        
+            dataB = TimeSeries.fetch(c, tsB, teB) # Fetch data before the glitch
+        
+            #print(dataB)
+            mean_dataB = dataB.mean().value
+            #print(mean_dataB)
+            B = dataB.to_value() - mean_dataB #detrending 
+            #print(dataB)
+            dataB = TimeSeries(B, t0 = dataB.t0, dt = dataB.dt, unit = '')
+        
+            if np.isnan(dataB.value).any():
+                print(f"dataB contains NaN for time {t}. Skipping calculation for this segment.")
+                continue
+        
+            psdB = dataB.psd(fftlength=Td, overlap=Td/2, method='welch')
+        
+            #print(type(psdB))
+        
+            freq = psdB.frequencies.value
+        
+            all_freq.append(freq)
+            all_psdB.append(psdB.value)
+            # Get data near glitch
+            if i < 1:
+                tsN = t - 31  # Start time 31 seconds before t
+                teN = t - 1   # End time 1 second before t
+            else:
+                tsN = t - (60 * i) + 31   # Start time 31 seconds before the time interval
+                teN = t - (60 * (i - 1)) + 1  # End time 1 second before the previous minute
+
+        
+            dataN = TimeSeries.fetch(c, tsN, teN)  # Fetch data near the glitch
+            mean_dataN = dataN.mean().value   #detrended
+        
+            N = dataN.to_value() - mean_dataN
+        
+            dataN = TimeSeries(N, t0 = dataN.t0, dt = dataN.dt, unit = '')
+        
+            psdN = dataN.psd(fftlength=Td, overlap=Td/2, method='welch')
+            all_psdN.append(psdN.value)
+
+# Define the number of samples per channel
+num_time_samples = 100  # For example, using `t_samp[0:10]`
+num_intervals = 3  # From `times = [0.5, 1, 1.5]`
+num_channels = len(chan)  # Number of channels
+
+# Calculate the number of PSD entries per channel
+entries_per_channel = num_time_samples * num_intervals
+
+# Initialize dictionaries for each channel
+psdN_by_channel = {c: [] for c in chan}
+psdB_by_channel = {c: [] for c in chan}
+freq_by_channel = {c: [] for c in chan}
+
+# Separate all_psdN and all_psdB into channel-specific arrays
+for idx, c in enumerate(chan):
+    start_idx = idx * entries_per_channel
+    end_idx = start_idx + entries_per_channel
+    
+    # Assign the specific slices to each channel
+    psdN_by_channel[c] = all_psdN[start_idx:end_idx]
+    psdB_by_channel[c] = all_psdB[start_idx:end_idx]
+    freq_by_channel[c] = all_freq[start_idx:end_idx]
+
+# Initialize dictionaries to hold lists of lists for each interval
+psdN_by_interval = {c: {0.5: [], 1: [], 1.5: []} for c in chan}
+psdB_by_interval = {c: {0.5: [], 1: [], 1.5: []} for c in chan}
+
+# Loop through each channel
+for c in chan:
+    for idx, psdN_entry in enumerate(psdN_by_channel[c]):
+        # Use modular indexing to classify each entry by interval
+        if idx % 3 == 0:
+            psdN_by_interval[c][0.5].append(psdN_entry)  # 0.5 min interval
+        elif idx % 3 == 1:
+            psdN_by_interval[c][1].append(psdN_entry)    # 1 min interval
+        elif idx % 3 == 2:
+            psdN_by_interval[c][1.5].append(psdN_entry)  # 1.5 min interval
+
+    for idx, psdB_entry in enumerate(psdB_by_channel[c]):
+        # Use modular indexing to classify each entry by interval
+        if idx % 3 == 0:
+            psdB_by_interval[c][0.5].append(psdB_entry)  # 0.5 min interval
+        elif idx % 3 == 1:
+            psdB_by_interval[c][1].append(psdB_entry)    # 1 min interval
+        elif idx % 3 == 2:
+            psdB_by_interval[c][1.5].append(psdB_entry)  # 1.5 min interval
+
+# For channel 'L1:LSC-DARM_IN1_DQ'
+psdN_0_5_DARM = psdN_by_interval['L1:LSC-DARM_IN1_DQ'][0.5]
+psdN_1_DARM = psdN_by_interval['L1:LSC-DARM_IN1_DQ'][1]
+psdN_1_5_DARM = psdN_by_interval['L1:LSC-DARM_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-PRCL_IN1_DQ'
+psdN_0_5_PRCL = psdN_by_interval['L1:LSC-PRCL_IN1_DQ'][0.5]
+psdN_1_PRCL = psdN_by_interval['L1:LSC-PRCL_IN1_DQ'][1]
+psdN_1_5_PRCL = psdN_by_interval['L1:LSC-PRCL_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-SRCL_IN1_DQ'
+psdN_0_5_SRCL = psdN_by_interval['L1:LSC-SRCL_IN1_DQ'][0.5]
+psdN_1_SRCL = psdN_by_interval['L1:LSC-SRCL_IN1_DQ'][1]
+psdN_1_5_SRCL = psdN_by_interval['L1:LSC-SRCL_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-MICH_IN1_DQ'
+psdN_0_5_MICH = psdN_by_interval['L1:LSC-MICH_IN1_DQ'][0.5]
+psdN_1_MICH = psdN_by_interval['L1:LSC-MICH_IN1_DQ'][1]
+psdN_1_5_MICH = psdN_by_interval['L1:LSC-MICH_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-CARM_IN1_DQ'
+psdN_0_5_CARM = psdN_by_interval['L1:LSC-CARM_IN1_DQ'][0.5]
+psdN_1_CARM = psdN_by_interval['L1:LSC-CARM_IN1_DQ'][1]
+psdN_1_5_CARM = psdN_by_interval['L1:LSC-CARM_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-MCL_IN1_DQ'
+psdN_0_5_MCL = psdN_by_interval['L1:LSC-MCL_IN1_DQ'][0.5]
+psdN_1_MCL = psdN_by_interval['L1:LSC-MCL_IN1_DQ'][1]
+psdN_1_5_MCL = psdN_by_interval['L1:LSC-MCL_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-DARM_IN1_DQ'
+psdB_0_5_DARM = psdB_by_interval['L1:LSC-DARM_IN1_DQ'][0.5]
+psdB_1_DARM = psdB_by_interval['L1:LSC-DARM_IN1_DQ'][1]
+psdB_1_5_DARM = psdB_by_interval['L1:LSC-DARM_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-PRCL_IN1_DQ'
+psdB_0_5_PRCL = psdB_by_interval['L1:LSC-PRCL_IN1_DQ'][0.5]
+psdB_1_PRCL = psdB_by_interval['L1:LSC-PRCL_IN1_DQ'][1]
+psdB_1_5_PRCL = psdB_by_interval['L1:LSC-PRCL_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-SRCL_IN1_DQ'
+psdB_0_5_SRCL = psdB_by_interval['L1:LSC-SRCL_IN1_DQ'][0.5]
+psdB_1_SRCL = psdB_by_interval['L1:LSC-SRCL_IN1_DQ'][1]
+psdB_1_5_SRCL = psdB_by_interval['L1:LSC-SRCL_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-MICH_IN1_DQ'
+psdB_0_5_MICH = psdB_by_interval['L1:LSC-MICH_IN1_DQ'][0.5]
+psdB_1_MICH = psdB_by_interval['L1:LSC-MICH_IN1_DQ'][1]
+psdB_1_5_MICH = psdB_by_interval['L1:LSC-MICH_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-CARM_IN1_DQ'
+psdB_0_5_CARM = psdB_by_interval['L1:LSC-CARM_IN1_DQ'][0.5]
+psdB_1_CARM = psdB_by_interval['L1:LSC-CARM_IN1_DQ'][1]
+psdB_1_5_CARM = psdB_by_interval['L1:LSC-CARM_IN1_DQ'][1.5]
+
+# For channel 'L1:LSC-MCL_IN1_DQ'
+psdB_0_5_MCL = psdB_by_interval['L1:LSC-MCL_IN1_DQ'][0.5]
+psdB_1_MCL = psdB_by_interval['L1:LSC-MCL_IN1_DQ'][1]
+psdB_1_5_MCL = psdB_by_interval['L1:LSC-MCL_IN1_DQ'][1.5]
+
+
+import numpy as np
+
+# Helper function to save each PSD ratio list to a text file
+def save_psd_ratios(psd_ratios, filename):
+    with open(filename, 'w') as f:
+        for array in psd_ratios:
+            np.savetxt(f, array, newline=" ", fmt="%.5f")
+            f.write("\n")  # Newline between arrays for readability
+
+# For channel 'L1:LSC-DARM_IN1_DQ'
+psd_ratios_0_5_DARM = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_0_5_DARM, psdB_0_5_DARM)]
+save_psd_ratios(psd_ratios_0_5_DARM, 'psd_ratios_0_5_DARM.txt')
+
+psd_ratios_1_DARM = [np.divide(psdN_array, psdB_array, 
+                               out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                     for psdN_array, psdB_array in zip(psdN_1_DARM, psdB_1_DARM)]
+save_psd_ratios(psd_ratios_1_DARM, 'psd_ratios_1_DARM.txt')
+
+psd_ratios_1_5_DARM = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_1_5_DARM, psdB_1_5_DARM)]
+save_psd_ratios(psd_ratios_1_5_DARM, 'psd_ratios_1_5_DARM.txt')
+
+# For channel 'L1:LSC-PRCL_IN1_DQ'
+psd_ratios_0_5_PRCL = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_0_5_PRCL, psdB_0_5_PRCL)]
+save_psd_ratios(psd_ratios_0_5_PRCL, 'psd_ratios_0_5_PRCL.txt')
+
+psd_ratios_1_PRCL = [np.divide(psdN_array, psdB_array, 
+                               out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                     for psdN_array, psdB_array in zip(psdN_1_PRCL, psdB_1_PRCL)]
+save_psd_ratios(psd_ratios_1_PRCL, 'psd_ratios_1_PRCL.txt')
+
+psd_ratios_1_5_PRCL = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_1_5_PRCL, psdB_1_5_PRCL)]
+save_psd_ratios(psd_ratios_1_5_PRCL, 'psd_ratios_1_5_PRCL.txt')
+
+# For channel 'L1:LSC-SRCL_IN1_DQ'
+psd_ratios_0_5_SRCL = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_0_5_SRCL, psdB_0_5_SRCL)]
+save_psd_ratios(psd_ratios_0_5_SRCL, 'psd_ratios_0_5_SRCL.txt')
+
+psd_ratios_1_SRCL = [np.divide(psdN_array, psdB_array, 
+                               out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                     for psdN_array, psdB_array in zip(psdN_1_SRCL, psdB_1_SRCL)]
+save_psd_ratios(psd_ratios_1_SRCL, 'psd_ratios_1_SRCL.txt')
+
+psd_ratios_1_5_SRCL = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_1_5_SRCL, psdB_1_5_SRCL)]
+save_psd_ratios(psd_ratios_1_5_SRCL, 'psd_ratios_1_5_SRCL.txt')
+
+# For channel 'L1:LSC-MICH_IN1_DQ'
+psd_ratios_0_5_MICH = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_0_5_MICH, psdB_0_5_MICH)]
+save_psd_ratios(psd_ratios_0_5_MICH, 'psd_ratios_0_5_MICH.txt')
+
+psd_ratios_1_MICH = [np.divide(psdN_array, psdB_array, 
+                               out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                     for psdN_array, psdB_array in zip(psdN_1_MICH, psdB_1_MICH)]
+save_psd_ratios(psd_ratios_1_MICH, 'psd_ratios_1_MICH.txt')
+
+psd_ratios_1_5_MICH = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_1_5_MICH, psdB_1_5_MICH)]
+save_psd_ratios(psd_ratios_1_5_MICH, 'psd_ratios_1_5_MICH.txt')
+
+# For channel 'L1:LSC-CARM_IN1_DQ'
+psd_ratios_0_5_CARM = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_0_5_CARM, psdB_0_5_CARM)]
+save_psd_ratios(psd_ratios_0_5_CARM, 'psd_ratios_0_5_CARM.txt')
+
+psd_ratios_1_CARM = [np.divide(psdN_array, psdB_array, 
+                               out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                     for psdN_array, psdB_array in zip(psdN_1_CARM, psdB_1_CARM)]
+save_psd_ratios(psd_ratios_1_CARM, 'psd_ratios_1_CARM.txt')
+
+psd_ratios_1_5_CARM = [np.divide(psdN_array, psdB_array, 
+                                 out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                       for psdN_array, psdB_array in zip(psdN_1_5_CARM, psdB_1_5_CARM)]
+save_psd_ratios(psd_ratios_1_5_CARM, 'psd_ratios_1_5_CARM.txt')
+
+# For channel 'L1:LSC-MCL_IN1_DQ'
+psd_ratios_0_5_MCL = [np.divide(psdN_array, psdB_array, 
+                                out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                      for psdN_array, psdB_array in zip(psdN_0_5_MCL, psdB_0_5_MCL)]
+save_psd_ratios(psd_ratios_0_5_MCL, 'psd_ratios_0_5_MCL.txt')
+
+psd_ratios_1_MCL = [np.divide(psdN_array, psdB_array, 
+                              out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                    for psdN_array, psdB_array in zip(psdN_1_MCL, psdB_1_MCL)]
+save_psd_ratios(psd_ratios_1_MCL, 'psd_ratios_1_MCL.txt')
+
+psd_ratios_1_5_MCL = [np.divide(psdN_array, psdB_array, 
+                                out=np.zeros_like(psdN_array, dtype=float), where=(psdB_array != 0))
+                      for psdN_array, psdB_array in zip(psdN_1_5_MCL, psdB_1_5_MCL)]
+save_psd_ratios(psd_ratios_1_5_MCL, 'psd_ratios_1_5_MCL.txt')
+
+import numpy as np
+import pandas as pd
+from scipy import stats as f
+
+# Define the function to detect outliers
+def outliers(freq, ratio, N, threshold, csv_filename):
+    # Calculate confidence interval based on F-distribution
+    r1, r2 = f.interval(1 - threshold / len(ratio), N, N)
+
+    # Identify outliers below and above the confidence interval
+    LowrOutliers = {
+        'frequency': freq[ratio < r1],
+        'ratio': ratio[ratio < r1],
+        'probability': len(ratio) * f.cdf(ratio[ratio < r1], N, N)
+    }
+    LowrOutliersdf = pd.DataFrame(LowrOutliers)
+
+    HighrOutliers = {
+        'frequency': freq[ratio > r2],
+        'ratio': ratio[ratio > r2],
+        'probability': len(ratio) * f.sf(ratio[ratio > r2], N, N)
+    }
+    HighrOutliersdf = pd.DataFrame(HighrOutliers)
+
+    # Combine low and high outliers into a single DataFrame
+    Outliersdf = pd.concat([LowrOutliersdf, HighrOutliersdf], ignore_index=True)
+    Outliersdf = Outliersdf.sort_values(by=['frequency'], ignore_index=True)
+    
+    # Save outliers data to a CSV file
+    Outliersdf.to_csv(csv_filename, index=False)
+    
+    return Outliersdf
+
+
+# For channel 'L1:LSC-DARM_IN1_DQ'
+outliers_0_5_DARM = outliers(all_freq[0], psd_ratios_0_5_DARM, 30 , 0.001, 'outliers_0_5_DARM.csv')
+outliers_1_DARM = outliers(all_freq[0], psd_ratios_1_DARM, 30 , 0.001, 'outliers_1_DARM.csv')
+outliers_1_5_DARM = outliers(all_freq[0], psd_ratios_1_5_DARM, 30, 0.001, 'outliers_1_5_DARM.csv')
+
+# For channel 'L1:LSC-PRCL_IN1_DQ'
+outliers_0_5_PRCL = outliers(all_freq[0], psd_ratios_0_5_PRCL, 30, 0.001, 'outliers_0_5_PRCL.csv')
+outliers_1_PRCL = outliers(all_freq[0], psd_ratios_1_PRCL, 30, 0.001, 'outliers_1_PRCL.csv')
+outliers_1_5_PRCL = outliers(all_freq[0], psd_ratios_1_5_PRCL, 30, 0.001, 'outliers_1_5_PRCL.csv')
+
+# For channel 'L1:LSC-SRCL_IN1_DQ'
+outliers_0_5_SRCL = outliers(all_freq[0], psd_ratios_0_5_SRCL, 30, 0.001, 'outliers_0_5_SRCL.csv')
+outliers_1_SRCL = outliers(all_freq[0], psd_ratios_1_SRCL, 30, 0.001, 'outliers_1_SRCL.csv')
+outliers_1_5_SRCL = outliers(all_freq[0], psd_ratios_1_5_SRCL, 30, 0.001, 'outliers_1_5_SRCL.csv')
+
+# For channel 'L1:LSC-MICH_IN1_DQ'
+outliers_0_5_MICH = outliers(all_freq[0], psd_ratios_0_5_MICH, 30, 0.001, 'outliers_0_5_MICH.csv')
+outliers_1_MICH = outliers(all_freq[0], psd_ratios_1_MICH, 30, 0.001, 'outliers_1_MICH.csv')
+outliers_1_5_MICH = outliers(all_freq[0], psd_ratios_1_5_MICH, 30, 0.001, 'outliers_1_5_MICH.csv')
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# Assuming you have a list of DataFrames for outliers at 1-minute intervals for each channel
+# Example: outliers_1_min_DARM, outliers_1_min_PRCL, etc. (these should already be available)
+
+# Define function to plot histogram and save the figure
+def plot_outlier_histogram(outliers_1_min_df, channel_name, bin_size=10, log_scale=True, save_path='./'):
+    # Step 1: Combine outliers (if more than one DataFrame is passed, concatenate them)
+    combined_outliers_1_min_df = pd.concat(outliers_1_min_df, ignore_index=True)
+    
+    # Step 2: Extract frequencies from the combined DataFrame
+    frequencies_1_min = combined_outliers_1_min_df['frequency']
+    
+    # Define the bin edges for a histogram with bins of 'bin_size' Hz
+    bin_edges = range(int(frequencies_1_min.min()), int(frequencies_1_min.max()) + bin_size, bin_size)
+    
+    # Step 3: Plot the histogram
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(1, 1, 1)
+    
+    # Plot the histogram for outliers
+    ax.hist(frequencies_1_min, bins=bin_edges, edgecolor='black', density=True, color='yellow')
+    
+    # Set logarithmic scale for the x-axis if specified
+    if log_scale:
+        ax.set_xscale('log')
+    
+    # Set y-axis limit
+    ax.set_ylim(0, 3.5e-3)
+    
+    # Set the background and colors as black and white
+    ax.set_facecolor('black')
+    fig.patch.set_facecolor('black')
+    
+    # Set border color to black
+    ax.spines['top'].set_color('black')
+    ax.spines['bottom'].set_color('black')
+    ax.spines['left'].set_color('black')
+    ax.spines['right'].set_color('black')
+    
+    # Set font color to white
+    ax.xaxis.label.set_color('white')
+    ax.yaxis.label.set_color('white')
+    ax.title.set_color('white')
+    ax.tick_params(axis='x', colors='white')
+    ax.tick_params(axis='y', colors='white')
+    
+    # Add labels and title
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('PDF')
+    plt.title(f'Histogram of Outlier Frequencies for {channel_name} (1 Min)')
+    plt.grid(True)
+    
+    # Save the plot as a .png file
+    save_file = f"{save_path}outlier_histogram_{channel_name}_1min.png"
+    plt.savefig(save_file, bbox_inches='tight', dpi=300)
+    print(f"Saved histogram for {channel_name} at {save_file}")
+    
+    # Show the plot
+    plt.show()
+
+# Example of how to call the function for different channels
+# Here you would pass in the DataFrame for each channel (outliers at 1-minute intervals)
+
+# Define the path where the figures will be saved (can be customized)
+save_path = '/home/sadmansobhan.raabith/multichananalysis/'
+
+# Make sure the directory exists
+import os
+if not os.path.exists(save_path):
+    os.makedirs(save_path)
+
+# For channel 'DARM'
+plot_outlier_histogram([outliers_1_min_DARM], 'DARM', save_path=save_path)
+
+# For channel 'PRCL'
+plot_outlier_histogram([outliers_1_min_PRCL], 'PRCL', save_path=save_path)
+
+# For channel 'SRCL'
+plot_outlier_histogram([outliers_1_min_SRCL], 'SRCL', save_path=save_path)
+
+# For channel 'MICH'
+plot_outlier_histogram([outliers_1_min_MICH], 'MICH', save_path=save_path)
